@@ -1,94 +1,89 @@
-const router = require('express').Router();
-const { getDb, uid } = require('../db/database');
-const { authMiddleware, requireRol } = require('../middleware/auth');
+const router = require('express').Router()
+const { loadDb, findAll, findOne, findById, insert, update, uid } = require('../db/database')
+const { authMiddleware, requireRol } = require('../middleware/auth')
 
-router.use(authMiddleware);
+router.use(authMiddleware)
 
-// GET /api/practicas  — devuelve según rol
+// GET /api/practicas
 router.get('/', (req, res) => {
-  const db = getDb();
-  let practicas;
+  loadDb()
+  const practicas = findAll('practicas')
+  const usuarios  = findAll('usuarios')
+
   if (req.user.rol === 'estudiante') {
-    practicas = db.prepare('SELECT * FROM practicas WHERE estudianteId = ? ORDER BY fechaCreacion DESC').all(req.user.id);
-  } else {
-    practicas = db.prepare('SELECT p.*, u.nombre as estudianteNombre FROM practicas p JOIN usuarios u ON p.estudianteId = u.id ORDER BY p.fechaCreacion DESC').all();
+    const mias = practicas.filter(p => p.estudianteId === req.user.id)
+    return res.json(mias.map(p => enrich(p, usuarios)))
   }
-  res.json(practicas);
-});
+  res.json(practicas.map(p => enrich(p, usuarios)).sort((a,b) => b.fechaCreacion.localeCompare(a.fechaCreacion)))
+})
+
+function enrich(p, usuarios) {
+  const est = usuarios.find(u => u.id === p.estudianteId)
+  return { ...p, estudianteNombre: est?.nombre || '—' }
+}
 
 // GET /api/practicas/:id
 router.get('/:id', (req, res) => {
-  const db = getDb();
-  const p = db.prepare('SELECT p.*, u.nombre as estudianteNombre FROM practicas p JOIN usuarios u ON p.estudianteId = u.id WHERE p.id = ?').get(req.params.id);
-  if (!p) return res.status(404).json({ error: 'Práctica no encontrada' });
-  res.json(p);
-});
+  loadDb()
+  const p = findById('practicas', req.params.id)
+  if (!p) return res.status(404).json({ error: 'Práctica no encontrada' })
+  const usuarios = findAll('usuarios')
+  res.json(enrich(p, usuarios))
+})
 
-// POST /api/practicas — solo estudiante
+// POST /api/practicas
 router.post('/', requireRol('estudiante'), (req, res) => {
-  const db = getDb();
-  const { empresa, horas, descripcion, hitos = [], competencias = [] } = req.body;
+  loadDb()
+  const { empresa, horas, descripcion, hitos = [], competencias = [] } = req.body
+  if (!empresa || !horas || !descripcion) return res.status(400).json({ error: 'Empresa, horas y descripción son obligatorios' })
+  if (hitos.length < 3)  return res.status(400).json({ error: 'Se requieren al menos 3 hitos' })
+  if (competencias.length < 5) return res.status(400).json({ error: 'Se requieren al menos 5 competencias' })
 
-  if (!empresa || !horas || !descripcion) return res.status(400).json({ error: 'Empresa, horas y descripción son obligatorios' });
-  if (hitos.length < 3) return res.status(400).json({ error: 'Se requieren al menos 3 hitos' });
-  if (competencias.length < 5) return res.status(400).json({ error: 'Se requieren al menos 5 competencias' });
+  const activa = findAll('practicas').find(p =>
+    p.estudianteId === req.user.id && ['propuesta','validada','activa','en_evaluacion'].includes(p.estado)
+  )
+  if (activa) return res.status(409).json({ error: 'Ya tienes una práctica activa o en curso' })
 
-  // R3: un estudiante solo puede tener una práctica activa
-  const activa = db.prepare(`SELECT id FROM practicas WHERE estudianteId = ? AND estado IN ('propuesta','validada','activa','en_evaluacion')`).get(req.user.id);
-  if (activa) return res.status(409).json({ error: 'Ya tienes una práctica activa o en curso' });
+  const id  = uid()
+  const now = new Date().toISOString()
+  insert('practicas', { id, estudianteId: req.user.id, empresa, horas: Number(horas), descripcion, estado: 'propuesta', fechaCreacion: now, planValidado: false, tutorId: null, profesorId: null })
 
-  const id = uid();
-  const now = new Date().toISOString();
+  hitos.forEach((nombre, i) => insert('hitos', { id: uid(), practicaId: id, nombre, descripcion: '', orden: i+1, estado: 'pendiente', evaluadoPor: null, fechaEval: null }))
+  competencias.forEach(nombre => insert('competencias', { id: uid(), practicaId: id, nombre, descripcion: '', estado: 'en_proceso', evaluadoPor: null, fechaEval: null }))
+  insert('transiciones', { id: uid(), practicaId: id, desde: '-', hacia: 'propuesta', actor: req.user.nombre, motivo: 'Propuesta creada', timestamp: now })
 
-  db.prepare('INSERT INTO practicas VALUES (?,?,?,?,?,?,?,?,?,?)').run(
-    id, req.user.id, empresa, Number(horas), descripcion, 'propuesta', now, 0, null, null
-  );
+  res.status(201).json({ id, message: 'Propuesta creada exitosamente' })
+})
 
-  hitos.forEach((nombre, i) => {
-    db.prepare('INSERT INTO hitos VALUES (?,?,?,?,?,?,?,?)').run(uid(), id, nombre, '', i + 1, 'pendiente', null, null);
-  });
-
-  competencias.forEach(nombre => {
-    db.prepare('INSERT INTO competencias VALUES (?,?,?,?,?,?,?)').run(uid(), id, nombre, '', 'en_proceso', null, null);
-  });
-
-  db.prepare('INSERT INTO transiciones VALUES (?,?,?,?,?,?,?)').run(uid(), id, '-', 'propuesta', req.user.nombre, 'Propuesta creada', now);
-
-  res.status(201).json({ id, message: 'Propuesta creada exitosamente' });
-});
-
-// PATCH /api/practicas/:id/estado — cambia estado con validaciones de rol
+// PATCH /api/practicas/:id/estado
 router.patch('/:id/estado', (req, res) => {
-  const db = getDb();
-  const { estado, motivo = '' } = req.body;
-  const p = db.prepare('SELECT * FROM practicas WHERE id = ?').get(req.params.id);
-  if (!p) return res.status(404).json({ error: 'Práctica no encontrada' });
+  loadDb()
+  const { estado, motivo = '' } = req.body
+  const p = findById('practicas', req.params.id)
+  if (!p) return res.status(404).json({ error: 'Práctica no encontrada' })
 
-  // Validaciones de transición por rol
   const transicionesValidas = {
-    profesor:     { propuesta: 'validada' },
-    coordinador:  { validada: 'activa', en_evaluacion: 'aprobada' },
-    tutor:        {},
-    estudiante:   {}
-  };
+    profesor:    { propuesta: 'validada' },
+    coordinador: { validada: 'activa', en_evaluacion: 'aprobada' }
+  }
+  const permitido = transicionesValidas[req.user.rol]?.[p.estado] === estado
+  if (!permitido) return res.status(403).json({ error: `Transición ${p.estado} → ${estado} no permitida para tu rol` })
 
-  const permitido = transicionesValidas[req.user.rol]?.[p.estado] === estado;
-  if (!permitido) return res.status(403).json({ error: `Transición ${p.estado} → ${estado} no permitida para tu rol` });
+  const now = new Date().toISOString()
+  const patch = { estado }
+  if (estado === 'validada') patch.planValidado = true
+  update('practicas', p.id, patch)
+  insert('transiciones', { id: uid(), practicaId: p.id, desde: p.estado, hacia: estado, actor: req.user.nombre, motivo, timestamp: now })
 
-  const now = new Date().toISOString();
-  db.prepare('UPDATE practicas SET estado = ? WHERE id = ?').run(estado, p.id);
-  if (estado === 'validada') db.prepare('UPDATE practicas SET planValidado = 1 WHERE id = ?').run(p.id);
-
-  db.prepare('INSERT INTO transiciones VALUES (?,?,?,?,?,?,?)').run(uid(), p.id, p.estado, estado, req.user.nombre, motivo, now);
-
-  res.json({ message: `Práctica actualizada a "${estado}"` });
-});
+  res.json({ message: `Práctica actualizada a "${estado}"` })
+})
 
 // GET /api/practicas/:id/transiciones
 router.get('/:id/transiciones', (req, res) => {
-  const db = getDb();
-  const rows = db.prepare('SELECT * FROM transiciones WHERE practicaId = ? ORDER BY timestamp ASC').all(req.params.id);
-  res.json(rows);
-});
+  loadDb()
+  const rows = findAll('transiciones', { practicaId: req.params.id })
+    .sort((a,b) => a.timestamp.localeCompare(b.timestamp))
+  res.json(rows)
+})
 
-module.exports = router;
+module.exports = router

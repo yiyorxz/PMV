@@ -1,54 +1,48 @@
-const router = require('express').Router();
-const { getDb, uid } = require('../db/database');
-const { authMiddleware, requireRol } = require('../middleware/auth');
+const router = require('express').Router()
+const { loadDb, findAll, findById, insert, update, uid } = require('../db/database')
+const { authMiddleware, requireRol } = require('../middleware/auth')
 
-router.use(authMiddleware);
+router.use(authMiddleware)
 
 // GET /api/evaluaciones?practicaId=xxx
 router.get('/', (req, res) => {
-  const db = getDb();
-  const { practicaId } = req.query;
-  if (!practicaId) return res.status(400).json({ error: 'practicaId requerido' });
-  const rows = db.prepare('SELECT * FROM evaluaciones WHERE practicaId = ?').all(practicaId);
-  res.json(rows);
-});
+  const { practicaId } = req.query
+  if (!practicaId) return res.status(400).json({ error: 'practicaId requerido' })
+  loadDb()
+  res.json(findAll('evaluaciones', { practicaId }))
+})
 
 // GET /api/evaluaciones/competencias?practicaId=xxx
 router.get('/competencias', (req, res) => {
-  const db = getDb();
-  const { practicaId } = req.query;
-  if (!practicaId) return res.status(400).json({ error: 'practicaId requerido' });
-  const rows = db.prepare('SELECT * FROM competencias WHERE practicaId = ? ORDER BY rowid ASC').all(practicaId);
-  res.json(rows);
-});
+  const { practicaId } = req.query
+  if (!practicaId) return res.status(400).json({ error: 'practicaId requerido' })
+  loadDb()
+  res.json(findAll('competencias', { practicaId }))
+})
 
-// POST /api/evaluaciones — tutor emite evaluación de desempeño
+// POST /api/evaluaciones — tutor
 router.post('/', requireRol('tutor'), (req, res) => {
-  const db = getDb();
-  const { practicaId, concepto, comentario } = req.body;
-  if (!practicaId || !concepto) return res.status(400).json({ error: 'practicaId y concepto son obligatorios' });
+  loadDb()
+  const { practicaId, concepto, comentario } = req.body
+  if (!practicaId || !concepto) return res.status(400).json({ error: 'practicaId y concepto son obligatorios' })
 
-  const p = db.prepare("SELECT * FROM practicas WHERE id = ? AND estado = 'en_evaluacion'").get(practicaId);
-  if (!p) return res.status(400).json({ error: 'La práctica no está en evaluación' });
+  const p = findById('practicas', practicaId)
+  if (!p || p.estado !== 'en_evaluacion') return res.status(400).json({ error: 'La práctica no está en evaluación' })
 
-  const ya = db.prepare('SELECT id FROM evaluaciones WHERE practicaId = ? AND tutor = ?').get(practicaId, req.user.nombre);
-  if (ya) return res.status(409).json({ error: 'Ya emitiste una evaluación para esta práctica' });
+  const ya = findAll('evaluaciones', { practicaId }).find(e => e.tutor === req.user.nombre)
+  if (ya) return res.status(409).json({ error: 'Ya emitiste una evaluación para esta práctica' })
 
-  db.prepare('INSERT INTO evaluaciones VALUES (?,?,?,?,?,?)').run(
-    uid(), practicaId, req.user.nombre, concepto, comentario || '', new Date().toISOString()
-  );
-  res.status(201).json({ message: 'Evaluación de desempeño registrada' });
-});
+  insert('evaluaciones', { id: uid(), practicaId, tutor: req.user.nombre, concepto, comentario: comentario || '', fecha: new Date().toISOString() })
+  res.status(201).json({ message: 'Evaluación de desempeño registrada' })
+})
 
-// PATCH /api/evaluaciones/competencias/:id/evaluar — profesor evalúa competencia
+// PATCH /api/evaluaciones/competencias/:id/evaluar — profesor
 router.patch('/competencias/:id/evaluar', requireRol('profesor'), (req, res) => {
-  const db = getDb();
-  const comp = db.prepare('SELECT * FROM competencias WHERE id = ?').get(req.params.id);
-  if (!comp) return res.status(404).json({ error: 'Competencia no encontrada' });
+  loadDb()
+  const comp = findById('competencias', req.params.id)
+  if (!comp) return res.status(404).json({ error: 'Competencia no encontrada' })
+  update('competencias', comp.id, { estado: 'lograda', evaluadoPor: req.user.nombre, fechaEval: new Date().toISOString() })
+  res.json({ message: 'Competencia evaluada como lograda' })
+})
 
-  const now = new Date().toISOString();
-  db.prepare('UPDATE competencias SET estado = ?, evaluadoPor = ?, fechaEval = ? WHERE id = ?').run('lograda', req.user.nombre, now, comp.id);
-  res.json({ message: 'Competencia evaluada como lograda' });
-});
-
-module.exports = router;
+module.exports = router
